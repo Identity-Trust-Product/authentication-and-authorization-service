@@ -1,5 +1,6 @@
 package com.identityos.authentication_and_authorization_service.service;
 
+import com.identityos.authentication_and_authorization_service.client.trust.TrustSignalClient;
 import com.identityos.authentication_and_authorization_service.dto.OrganizationOtpResponse;
 import com.identityos.authentication_and_authorization_service.repository.OrganizationAuthRepository;
 import org.springframework.beans.factory.annotation.Value;
@@ -19,6 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class OrganizationOtpService {
     private final OrganizationAuthRepository organizationRepository;
     private final JavaMailSender mailSender;
+    private final TrustSignalClient trustSignalClient;
     private final SecureRandom secureRandom = new SecureRandom();
     private final Map<String, OtpAttempt> attempts = new ConcurrentHashMap<>();
     private final long expirySeconds;
@@ -29,12 +31,14 @@ public class OrganizationOtpService {
     public OrganizationOtpService(
             OrganizationAuthRepository organizationRepository,
             JavaMailSender mailSender,
+            TrustSignalClient trustSignalClient,
             @Value("${organization-auth.otp.expiry-seconds}") long expirySeconds,
             @Value("${organization-auth.otp.resend-seconds}") long resendSeconds,
             @Value("${organization-auth.otp.max-attempts}") int maxAttempts,
             @Value("${organization-auth.mail.from}") String mailFrom) {
         this.organizationRepository = organizationRepository;
         this.mailSender = mailSender;
+        this.trustSignalClient = trustSignalClient;
         this.expirySeconds = expirySeconds;
         this.resendSeconds = resendSeconds;
         this.maxAttempts = maxAttempts;
@@ -64,28 +68,42 @@ public class OrganizationOtpService {
         message.setSubject("Identity OS organization login OTP");
         message.setText("Your Identity OS verification code is " + otp + ". It expires in " + expirySeconds + " seconds.");
         mailSender.send(message);
+        trustSignalClient.record(
+                organizationId,
+                "OTP_REQUESTED",
+                "SUCCESS",
+                Map.of("channel", "email", "purpose", "organization-login"));
         return new OrganizationOtpResponse(true, "OTP sent to the registered representative email.", maskEmail(contact.email()), expirySeconds);
     }
 
     public OrganizationOtpResponse verifyOtp(String organizationId, String otp) {
         if (otp == null || !otp.matches("\\d{6}")) {
+            trustSignalClient.record(organizationId, "OTP_FAILED", "FAILED", Map.of("reason", "invalid_format"));
             return new OrganizationOtpResponse(false, "Enter a valid six-digit OTP.", null, 0);
         }
         OtpAttempt attempt = attempts.get(organizationId);
         if (attempt == null || attempt.expiresAt().isBefore(Instant.now())) {
             attempts.remove(organizationId);
+            trustSignalClient.record(organizationId, "OTP_FAILED", "FAILED", Map.of("reason", "expired_or_missing"));
             return new OrganizationOtpResponse(false, "OTP expired. Request a new OTP.", null, 0);
         }
         if (attempt.attempts() >= maxAttempts) {
             attempts.remove(organizationId);
+            trustSignalClient.record(organizationId, "OTP_FAILED", "FAILED", Map.of("reason", "max_attempts"));
             return new OrganizationOtpResponse(false, "Too many attempts. Request a new OTP.", null, 0);
         }
         OtpAttempt updated = attempt.withAttempts(attempt.attempts() + 1);
         attempts.put(organizationId, updated);
         if (!MessageDigest.isEqual(updated.hash(), hash(otp))) {
+            trustSignalClient.record(organizationId, "OTP_FAILED", "FAILED", Map.of("reason", "invalid_otp"));
             return new OrganizationOtpResponse(false, "Invalid OTP.", null, 0);
         }
         attempts.remove(organizationId);
+        trustSignalClient.record(
+                organizationId,
+                "OTP_VERIFIED",
+                "SUCCESS",
+                Map.of("channel", "email", "purpose", "organization-login"));
         return new OrganizationOtpResponse(true, "OTP verified. Continue with Keycloak login.", null, 0);
     }
 

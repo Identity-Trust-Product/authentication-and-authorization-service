@@ -39,3 +39,7 @@ management:
       exposure:
         include: health,info
 
+services:
+  trust:
+    url: ${TRUST_SERVICE_URL:http://localhost:8087}
+
